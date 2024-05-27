@@ -48,7 +48,14 @@ void fix_inode_bitmap(std::ifstream &fs, std::ofstream &fs_out, ext2_super_block
     }
 }
 
-void fix_block_bitmap(std::ifstream &fs, std::ofstream &fs_out, ext2_super_block &sb, std::vector<ext2_block_group_descriptor> &bgds, int block_size) {
+bool is_user_data_block(std::ifstream &fs, int block_num, int block_size, const std::vector<char> &data_identifier) {
+    std::vector<char> block_start(data_identifier.size());
+    fs.seekg(block_num * block_size, std::ios::beg);
+    fs.read(block_start.data(), data_identifier.size());
+    return block_start == data_identifier;
+}
+
+void fix_block_bitmap(std::ifstream &fs, std::ofstream &fs_out, ext2_super_block &sb, std::vector<ext2_block_group_descriptor> &bgds, int block_size, const std::vector<char> &data_identifier) {
     std::vector<unsigned char> block_bitmap(block_size);
     ext2_inode inode;
 
@@ -66,7 +73,9 @@ void fix_block_bitmap(std::ifstream &fs, std::ofstream &fs_out, ext2_super_block
             if (inode.size > 0 && inode.link_count > 0) {
                 for (int k = 0; k < 12; ++k) {
                     if (inode.direct_blocks[k] != 0) {
-                        block_bitmap[inode.direct_blocks[k] / 8] |= (1 << (inode.direct_blocks[k] % 8));
+                        if (is_user_data_block(fs, inode.direct_blocks[k], block_size, data_identifier)) {
+                            block_bitmap[inode.direct_blocks[k] / 8] |= (1 << (inode.direct_blocks[k] % 8));
+                        }
                     }
                 }
                 // Handle indirect blocks similarly...
@@ -74,13 +83,14 @@ void fix_block_bitmap(std::ifstream &fs, std::ofstream &fs_out, ext2_super_block
         }
 
         fs_out.seekp(bgds[i].block_bitmap * block_size, std::ios::beg);
+        std::cout << "writing block bitmap\n";
         fs_out.write(reinterpret_cast<char*>(block_bitmap.data()), block_size);
     }
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <image_file>\n";
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " <image_file> <data_identifier>\n";
         return 1;
     }
 
@@ -96,6 +106,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    std::vector<char> data_identifier(argv[2], argv[2] + 32);
+
     ext2_super_block sb;
     read_superblock(fs, sb);
 
@@ -108,7 +120,7 @@ int main(int argc, char *argv[]) {
     }
 
     fix_inode_bitmap(fs, fs_out, sb, bgds, block_size);
-    fix_block_bitmap(fs, fs_out, sb, bgds, block_size);
+    fix_block_bitmap(fs, fs_out, sb, bgds, block_size, data_identifier);
 
     fs.close();
     fs_out.close();
