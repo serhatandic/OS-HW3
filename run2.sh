@@ -1,0 +1,1 @@
+make && cp -r ./testcases2/* testcases-fixed2/ && ./recext2fs testcases-fixed2/example-2048-bitmap.img ./grader/identifier.txt && ./grader/grader ./testcases2/example-2048-baseline.img ./testcases2/example-2048-bitmap.img ./testcases-fixed2/example-2048-bitmap.img
