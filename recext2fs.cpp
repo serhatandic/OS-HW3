@@ -7,6 +7,8 @@
 #include "identifier.h"
 #include "ext2fs_print.h"
 #include <algorithm>
+#include <stack>
+#include <map>
 
 #define EXT2_BLOCK_SIZE(sb) (1024 << (sb).log_block_size)
 
@@ -268,6 +270,10 @@ public:
         blockBitmapRecovery.recoverBlockBitmaps();
     }
 
+    FileSystemReader &getFileSystemReader() {
+        return fsReader;
+    }
+
 private:
     FileSystemReader fsReader;
     InodeBitmapRecovery inodeBitmapRecovery;
@@ -278,6 +284,119 @@ private:
         print_super_block(&superBlock);
     }
 };
+
+class DirectoryTraversal {
+public:
+    DirectoryTraversal(FileSystemReader &fsReader)
+        : fsReader(fsReader), superBlock(fsReader.getSuperblock()) {}
+
+    void printDirectoryTree() {
+        ext2_inode rootInode;
+        fsReader.readInode(EXT2_ROOT_INODE, &rootInode);
+        std::map<uint32_t, std::string> inodeToName;
+        inodeToName[EXT2_ROOT_INODE] = "root";
+        traverseDirectory(EXT2_ROOT_INODE, rootInode, 0, inodeToName);
+    }
+
+private:
+    FileSystemReader &fsReader;
+    const ext2_super_block &superBlock;
+
+    void traverseDirectory(uint32_t inodeNumber, const ext2_inode &inode, int depth, std::map<uint32_t, std::string> &inodeToName) {
+        std::vector<ext2_dir_entry*> dirEntries = readDirectoryEntries(inode);
+        for (ext2_dir_entry *entry : dirEntries) {
+            if (entry->inode == 0) continue; // Skip invalid entries
+
+            std::string entryName(entry->name, entry->name_length & 0xFF);
+            if (entryName == "." || entryName == "..") continue; // Skip self and parent directories
+
+            inodeToName[entry->inode] = entryName;
+
+            // Print the current directory/file with proper indentation
+            for (int i = 0; i < depth + 1; ++i) {
+                std::cout << "-";
+            }
+
+            ext2_inode childInode;
+            fsReader.readInode(entry->inode, &childInode);
+            bool isDirectory = (childInode.mode & 0xF000) == EXT2_I_DTYPE;
+
+            std::cout << " " << entryName;
+            if (isDirectory) {
+                std::cout << "/";
+            }
+            std::cout << std::endl;
+
+            // Recursively traverse subdirectories
+            if (isDirectory) {
+                traverseDirectory(entry->inode, childInode, depth + 1, inodeToName);
+            }
+        }
+    }
+
+    std::vector<ext2_dir_entry*> readDirectoryEntries(const ext2_inode &inode) {
+        std::vector<ext2_dir_entry*> entries;
+        int blockSize = EXT2_BLOCK_SIZE(superBlock);
+
+        // Read direct blocks
+        for (int i = 0; i < EXT2_NUM_DIRECT_BLOCKS; ++i) {
+            if (inode.direct_blocks[i] == 0) continue;
+            readDirectoryEntriesFromBlock(inode.direct_blocks[i], entries);
+        }
+
+        // Read single indirect block
+        if (inode.single_indirect != 0) {
+            readIndirectBlocks(inode.single_indirect, 1, entries);
+        }
+
+        // Read double indirect block
+        if (inode.double_indirect != 0) {
+            readIndirectBlocks(inode.double_indirect, 2, entries);
+        }
+
+        // Read triple indirect block
+        if (inode.triple_indirect != 0) {
+            readIndirectBlocks(inode.triple_indirect, 3, entries);
+        }
+
+        return entries;
+    }
+
+    void readDirectoryEntriesFromBlock(uint32_t block, std::vector<ext2_dir_entry*> &entries) {
+        int blockSize = EXT2_BLOCK_SIZE(superBlock);
+        std::vector<char> buffer(blockSize);
+        fsReader.preadData(buffer.data(), blockSize, block * blockSize);
+
+        int offset = 0;
+        while (offset < blockSize) {
+            ext2_dir_entry *entry = reinterpret_cast<ext2_dir_entry *>(buffer.data() + offset);
+            if (entry->inode == 0 || entry->length == 0) break;
+            entries.push_back(entry);
+            offset += entry->length;
+
+            // Ensure entry length is a multiple of 4 to avoid misalignment issues
+            offset = (offset + 3) & ~3;
+        }
+    }
+
+    void readIndirectBlocks(uint32_t block, int level, std::vector<ext2_dir_entry*> &entries) {
+        if (level < 1) return;
+
+        int blockSize = EXT2_BLOCK_SIZE(superBlock);
+        std::vector<uint32_t> blockPointers(blockSize / sizeof(uint32_t));
+        fsReader.preadData(blockPointers.data(), blockSize, block * blockSize);
+
+        for (uint32_t pointer : blockPointers) {
+            if (pointer == 0) continue;
+            if (level == 1) {
+                readDirectoryEntriesFromBlock(pointer, entries);
+            } else {
+                readIndirectBlocks(pointer, level - 1, entries);
+            }
+        }
+    }
+};
+
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
@@ -292,6 +411,9 @@ int main(int argc, char *argv[]) {
     try {
         Ext2Recovery recovery(imagePath, dataIdentifier);
         recovery.recover();
+
+        DirectoryTraversal dirTraversal(recovery.getFileSystemReader());
+        dirTraversal.printDirectoryTree();
     } catch (const std::exception &ex) {
         std::cerr << "Error: " << ex.what() << std::endl;
         return EXIT_FAILURE;
